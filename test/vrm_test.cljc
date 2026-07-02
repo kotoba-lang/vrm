@@ -1,6 +1,97 @@
 (ns vrm-test
+  "Restoration-fidelity tests — one per original `kami-vrm/src/lib.rs`
+  `#[cfg(test)] mod tests` (kotoba-lang/kami-engine, deleted PR #82), plus
+  the namespace-loads smoke test."
   (:require [clojure.test :refer [deftest is testing]]
-            [vrm]))
+            [vrm]
+            [vrm.glb :as glb]
+            [vrm.json :as json]
+            [vrm.humanoid :as humanoid]))
+
 (deftest namespace-loads
   (testing "the restored CLJC namespace loads"
-    (is (some? vrm))))
+    (is (some? (the-ns 'vrm)))))
+
+;; mirrors `make_test_vrm` — a minimal VRM 1.0 GLB.
+(defn- make-test-vrm []
+  (let [json-map
+        {:asset {:version "2.0" :generator "kami-vrm-test"}
+         :extensionsUsed ["VRMC_vrm"]
+         :scene 0
+         :scenes [{:nodes [0]}]
+         :nodes [{:name "Root" :children [1 2]}
+                 {:name "Hips" :mesh 0 :skin 0 :translation [0 0.8 0]}
+                 {:name "Head" :mesh 1 :translation [0 0.4 0]}]
+         :meshes [{:name "Body" :primitives [{:attributes {:POSITION 0} :indices 1 :material 0}]}
+                  {:name "Hair" :primitives [{:attributes {:POSITION 2} :indices 3 :material 1}]}]
+         :materials [{:name "skin_material" :pbrMetallicRoughness {:baseColorFactor [0.9 0.7 0.6 1.0]}}
+                     {:name "hair_material" :pbrMetallicRoughness {:baseColorFactor [0.2 0.1 0.05 1.0]}}]
+         :accessors [{:bufferView 0 :componentType 5126 :count 3 :type "VEC3" :min [-0.5 -0.5 -0.5] :max [0.5 0.5 0.5]}
+                     {:bufferView 1 :componentType 5125 :count 3 :type "SCALAR"}
+                     {:bufferView 2 :componentType 5126 :count 3 :type "VEC3" :min [-0.3 0.0 -0.3] :max [0.3 0.5 0.3]}
+                     {:bufferView 3 :componentType 5125 :count 3 :type "SCALAR"}
+                     {:bufferView 4 :componentType 5126 :count 3 :type "MAT4"}]
+         :bufferViews [{:buffer 0 :byteOffset 0 :byteLength 36}
+                       {:buffer 0 :byteOffset 36 :byteLength 12}
+                       {:buffer 0 :byteOffset 48 :byteLength 36}
+                       {:buffer 0 :byteOffset 84 :byteLength 12}
+                       {:buffer 0 :byteOffset 96 :byteLength 192}]
+         :buffers [{:byteLength 288}]
+         :skins [{:joints [0 1 2] :inverseBindMatrices 4}]
+         :extensions {:VRMC_vrm {:specVersion "1.0"
+                                  :meta {:name "TestAvatar" :authors ["test"]
+                                         :licenseUrl "https://vrm.dev/licenses/1.0/"
+                                         :avatarPermission "everyone"}
+                                  :humanoid {:humanBones {:hips {:node 1} :head {:node 2}}}}}}
+        f32->bytes (fn [f] (glb/u32->le-bytes
+                            #?(:clj (Float/floatToIntBits (float f))
+                               :cljs (let [buf (js/ArrayBuffer. 4) view (js/DataView. buf)]
+                                       (.setFloat32 view 0 f true)
+                                       (bit-or (.getUint8 view 0)
+                                               (bit-shift-left (.getUint8 view 1) 8)
+                                               (bit-shift-left (.getUint8 view 2) 16)
+                                               (bit-shift-left (.getUint8 view 3) 24))))))
+        body-pos (mapcat f32->bytes [-0.5 0.0 0.0 0.5 0.0 0.0 0.0 1.0 0.0])
+        body-idx (mapcat glb/u32->le-bytes [0 1 2])
+        hair-pos (mapcat f32->bytes [-0.3 0.0 0.0 0.3 0.0 0.0 0.0 0.5 0.0])
+        hair-idx (mapcat glb/u32->le-bytes [0 1 2])
+        identity-mat4 [1.0 0.0 0.0 0.0 0.0 1.0 0.0 0.0 0.0 0.0 1.0 0.0 0.0 0.0 0.0 1.0]
+        ibm (mapcat (fn [_] (mapcat f32->bytes identity-mat4)) (range 3))
+        bin (vec (concat body-pos body-idx hair-pos hair-idx ibm))
+        json-bytes (glb/string->byte-seq (json/->json json-map))]
+    (glb/write-glb json-bytes bin)))
+
+;; mirrors `parse_test_vrm`
+(deftest parse-test-vrm
+  (let [doc (vrm/parse-vrm (make-test-vrm))]
+    (is (= :v1-0 (:version doc)))
+    (is (= "TestAvatar" (:name (:meta doc))))
+    (is (= 2 (count (:human-bones (:humanoid doc)))))
+    (is (= 2 (count (:meshes (:gltf doc)))))))
+
+;; mirrors `decompose_test_vrm`
+(deftest decompose-test-vrm
+  (let [doc (vrm/parse-vrm (make-test-vrm))
+        parts (vrm/decompose doc)]
+    (is (>= (count parts) 2))
+    (is (some #(= :body (:category %)) parts))
+    (is (some #(= :hair (:category %)) parts))))
+
+;; mirrors `compose_and_export_roundtrip`
+(deftest compose-and-export-roundtrip
+  (let [doc (vrm/parse-vrm (make-test-vrm))
+        parts (vrm/decompose doc)
+        sources (mapv (fn [p] {:part p :doc doc}) parts)
+        composed (vrm/compose sources {:skeleton-base 0})
+        output (vrm/export-glb composed)
+        chunks (glb/parse-glb output)]
+    (is (seq (:json chunks)))
+    (let [reparsed (vrm/parse-vrm output)]
+      (is (= "TestAvatar" (:name (:meta reparsed))))
+      (is (>= (count (:human-bones (:humanoid reparsed))) 2)))))
+
+;; mirrors `skeleton_extraction`
+(deftest skeleton-extraction
+  (let [doc (vrm/parse-vrm (make-test-vrm))
+        skeleton (humanoid/to-kami-skeleton doc)]
+    (is (= 3 (count (:bones skeleton))))))
