@@ -11,7 +11,7 @@
 
 (deftest namespace-loads
   (testing "the restored CLJC namespace loads"
-    (is (some? (the-ns 'vrm)))))
+    (is (some? (find-ns 'vrm)))))
 
 ;; mirrors `make_test_vrm` — a minimal VRM 1.0 GLB.
 (defn- make-test-vrm []
